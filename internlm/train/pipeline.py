@@ -114,7 +114,7 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
 
         # embedding and head
         embedding_head_cls = (Embedding1D, BaseScaleColumnParallelLinear)
-        ParallelGPT2Embeddings = try_import_ParallelGPT2Embeddings(gpc.config.model.embed_split_hidden)
+        ParallelGPT2Embeddings = try_import_ParallelGPT2Embeddings(gpc.config.model.get("embed_split_hidden", True))
         if ParallelGPT2Embeddings:
             embedding_head_cls = (Embedding1D, ParallelGPT2Embeddings, BaseScaleColumnParallelLinear)
 
