@@ -84,13 +84,19 @@ class AscendFlashSelfAttention(torch.nn.Module):
         causal: bool = True,
         softmax_scale: float = None,
         attention_dropout: float = 0.0,
+        use_varlen_fa=True,
     ):
         super().__init__()
         assert rearrange is not None, "Please install einops first, e.g., with pip install einops"
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.shape_order = "BSND"
+        self.use_varlen_fa = use_varlen_fa
         self.dropout_p = attention_dropout
+
+        if use_varlen_fa:
+            self.shape_order = "TND"
+        else:
+            self.shape_order = "BSND"
 
         if self.causal:
             self.sparse_mode = 0
@@ -139,7 +145,15 @@ class AscendFlashSelfAttention(torch.nn.Module):
         if softmax_scale:
             assert softmax_scale == self.softmax_scale
 
-        return self._forward(q, k, v, deterministic=deterministic, attention_mask=attention_mask)
+        return self._forward(
+            q,
+            k,
+            v,
+            actual_seq_qlen=cu_seqlens_q,
+            actual_seq_kvlen=cu_seqlens_k,
+            deterministic=deterministic,
+            attention_mask=attention_mask,
+        )
 
     def _forward(
         self,
@@ -169,18 +183,28 @@ class AscendFlashSelfAttention(torch.nn.Module):
             q, k, v = [rearrange(x, "b s h d -> b s (h d)") for x in [q, k, v]]
         elif self.shape_order == "SBH":
             q, k, v = [rearrange(x, "b s h d -> s b (h d)") for x in [q, k, v]]
-        elif self.shape_order != "BSND":
-            raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
+        elif self.shape_order == "TND":
+            assert B == 1
+            q, k, v = [rearrange(x, "b s h d -> (b s) h d") for x in [q, k, v]]
+        # elif self.shape_order != "BSND":
+        #     raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
 
         if attention_mask is None:
             attention_mask = torch.triu(torch.ones(S, S, device=get_current_device()), 1).bool()
+
+        assert not ((actual_seq_qlen is None) ^ (actual_seq_kvlen is None))
+
+        if actual_seq_qlen is not None:
+            actual_seq_qlen = actual_seq_qlen[1:].tolist()
+        if actual_seq_kvlen is not None:
+            actual_seq_kvlen = actual_seq_kvlen[1:].tolist()
 
         output = torch_npu.npu_fusion_attention(
             query=q,
             key=k,
             value=v,
             head_num=N,
-            input_layout="BSND",
+            input_layout=self.shape_order,
             pse=None,
             atten_mask=attention_mask,
             scale=self.softmax_scale,
@@ -189,14 +213,18 @@ class AscendFlashSelfAttention(torch.nn.Module):
             next_tockens=self.next_tockens,
             keep_prob=1 - self.dropout_p,
             inner_precise=0 if not deterministic else 2,
+            actual_seq_kvlen=actual_seq_kvlen,
+            actual_seq_qlen=actual_seq_qlen,
         )[0]
 
         if self.shape_order == "BSH":
             output = rearrange(output, "b s (h d) -> b s h d", h=N)
         elif self.shape_order == "SBH":
             output = rearrange(output, "s b (h d) -> b s h d", h=N)
-        elif self.shape_order != "BSND":
-            raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
+        elif self.shape_order == "TND":
+            output = rearrange(output, "s h d -> s (h d)")
+        # elif self.shape_order != "BSND":
+        #     raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
 
         return output
 
