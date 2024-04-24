@@ -3,6 +3,7 @@ TODO: add NPU CI
 """
 
 import math
+import random
 
 import pytest
 import torch
@@ -12,11 +13,13 @@ from torch import nn
 
 from internlm.accelerator import AcceleratorType, get_accelerator
 from internlm.model.modules.multi_head_attention import (
-    AscendFlashSelfAttention,
+    AscendFlashAttention,
     CrossAttention,
     SelfAttention,
 )
 from internlm.model.ops.fusion_ops_import_helper import try_import_RMSNorm
+from internlm.model.utils import pack_output_after_attn, unpack_qkv_before_attn
+from internlm.utils.common import set_random_seed
 
 RMSNorm = try_import_RMSNorm()
 
@@ -27,43 +30,13 @@ MICRO_BSZ = 1
 HEAD_DIM = HIDDEN_SZIE // HEAD_NUM
 VOCAB_SIZE = 32000
 
+NUM_KV_HEAD_LIST = [8, 32]
 MICRO_BSZ_LIST = [1, 2]
 DTYPE_LIST = [torch.bfloat16, torch.float16]
-NUM_KV_HEAD_LIST = [8, 32]
 USE_PADDING = [True, False]
+VAR_LEN = [True, False]
 
 internlm_accelerator = get_accelerator()
-
-
-def check_mean_and_std(name, out1, out2):
-    named1_mean = out1.to(dtype=torch.float64).mean()
-    named1_std = out1.to(dtype=torch.float64).std()
-    named2_mean = out2.to(dtype=torch.float64).mean()
-    named2_std = out2.to(dtype=torch.float64).std()
-    check_statistic_equality(name, named1_mean, named2_mean, eq=True, is_mean=True)
-    check_statistic_equality(name, named1_std, named2_std, eq=True, is_mean=False)
-
-
-def check_statistic_equality(name, value1, value2, eq=False, is_mean=True, threshold=1e-9):
-    if (abs(value1 - value2) < threshold) ^ eq:
-        if eq:
-            print(
-                f"On {name}, "
-                f"we have {'mean' if is_mean else 'std'}s of fa_out "
-                f"very {'close' if not eq else 'different'}, "
-                f"from :{value1} "
-                f"and  :{value2}",
-                flush=True,
-            )
-        else:
-            print(
-                f"On {name}, "
-                f"we have {'mean' if is_mean else 'std'}s of fa_out "
-                f"very {'close' if not eq else 'different'}, "
-                f"from :{value1} "
-                f"and  :{value2}",
-                flush=True,
-            )
 
 
 def do_cmp_attn(
@@ -78,42 +51,87 @@ def do_cmp_attn(
     dtype,
     attention_mask,  # pylint: disable=W0613
     softmax_scale,
+    var_len,
     attention_dropout=0.0,
+    cu_seqlens=None,
     **attn_args,  # pylint: disable=W0613
 ):
 
     npu_attn_cls = CrossAttention if N != N_KV else SelfAttention
-    npu_attn = npu_attn_cls(
-        causal=True,
-        softmax_scale=softmax_scale,
-        attention_dropout=attention_dropout,
+    npu_attn = npu_attn_cls(causal=True, softmax_scale=softmax_scale, attention_dropout=attention_dropout).to(dtype)
+    npu_flash_attn = AscendFlashAttention(
+        causal=True, softmax_scale=softmax_scale, attention_dropout=attention_dropout
     ).to(dtype)
-    npu_flash_attn = AscendFlashSelfAttention(
-        causal=True,
-        softmax_scale=softmax_scale,
-        attention_dropout=attention_dropout,
-    ).to(dtype)
+
+    q_fa = q.clone()
+    k_fa = k.clone()
+    v_fa = v.clone()
+    if cu_seqlens is not None:
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+    else:
+        max_seqlen = None
 
     if N == N_KV:
-        a = npu_attn(torch.concat([q, k, v], dim=2))  # pylint: disable=E1102
-    else:
-        a = npu_attn(q.squeeze(dim=2), torch.concat([k, v], dim=2))  # pylint: disable=E1102
+        qkv = torch.concat([q, k, v], dim=2)
 
-    b = npu_flash_attn(q=q, k=k, v=v)  # pylint: disable=E1102
+        if var_len:
+            qkv = unpack_qkv_before_attn(qkv, cu_seqlens)
+
+        a = npu_attn(qkv)  # pylint: disable=E1102
+
+        if var_len:
+            a = rearrange(a, "b s h d -> b s (h d)")
+            a = pack_output_after_attn(a, cu_seqlens, packed_len=B * S)
+    else:
+        q = q.squeeze(dim=2)
+        kv = torch.concat([k, v], dim=2)
+        # import pdb; pdb.set_trace()
+
+        if var_len:
+            q = unpack_qkv_before_attn(q, cu_seqlens)
+            kv = unpack_qkv_before_attn(kv, cu_seqlens)
+
+        a = npu_attn(q, kv)  # pylint: disable=E1102
+
+        if var_len:
+            a = rearrange(a, "b s h d -> b s (h d)")  # recover the shape
+            a = pack_output_after_attn(a, cu_seqlens, packed_len=B * S)
+
+    b = npu_flash_attn(  # pylint: disable=E1102
+        q=q_fa,
+        k=k_fa,
+        v=v_fa,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+    )
+
     assert torch.isfinite(a).all().item() and torch.isfinite(b).all().item()
 
     if dtype == torch.bfloat16:
         # torch_npu's equal not support bfloat16 by now.
-        assert torch.allclose(a.to(torch.float32), b.to(torch.float32), atol=5e-2, rtol=1e-4), f"{name} not pass"
+        assert torch.allclose(
+            a.to(torch.float32), b.to(torch.float32), atol=5e-2, rtol=1e-4
+        ), f"{name} not pass, a: {a}, b: {b}"
     else:
-        assert torch.allclose(a, b, atol=5e-2, rtol=1e-4), f"{name} not pass"
+        assert torch.allclose(a, b, atol=5e-2, rtol=1e-4), f"{name} not pass, a: {a}, b: {b}"
 
 
-def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
+def npu_transform(B, S, N, N_KV, D, dtype, use_padding, var_len):
+    set_random_seed(1024)
+
     if use_padding:
         x = torch.LongTensor([[i + 1 if i < S // 2 else 0 for i in range(S)] for _ in range(B)]).npu()  # padding S-1024
     else:
         x = torch.LongTensor([[i + 1 for i in range(S)] for _ in range(B)]).npu()  # no-padiing
+
+    cu_seqlens = None
+    if var_len:
+        cu_seqlens = [0] + sorted(random.sample(list(range(x.numel())), 4))
+        if cu_seqlens[-1] != x.numel():
+            cu_seqlens.append(x.numel())
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int64, device="npu")
 
     wq = torch.zeros((N * D, N * D), dtype=dtype, device="npu")
     wk = torch.zeros((N_KV * D, N * D), dtype=dtype, device="npu")
@@ -133,9 +151,14 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
     k = F.linear(embed_x, wk)  # pylint: disable=E1102
     v = F.linear(embed_x, wv)  # pylint: disable=E1102
 
-    q = rearrange(q, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
-    k = rearrange(k, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
-    v = rearrange(v, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
+    if var_len:
+        q = rearrange(q, "b s (one h d) -> (b s) one h d", b=B, s=S, d=D, one=1).unsqueeze(0)
+        k = rearrange(k, "b s (one h d) -> (b s) one h d", b=B, s=S, d=D, one=1).unsqueeze(0)
+        v = rearrange(v, "b s (one h d) -> (b s) one h d", b=B, s=S, d=D, one=1).unsqueeze(0)
+    else:
+        q = rearrange(q, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
+        k = rearrange(k, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
+        v = rearrange(v, "b s (one h d) -> b s one h d", b=B, s=S, d=D, one=1)
 
     do_cmp_attn(
         f"B_{B}_S_{S}_N_{N}_N_KV_{N_KV}_D_{D}_{dtype}",
@@ -149,6 +172,8 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
         dtype,
         None,
         1 / math.sqrt(HIDDEN_SZIE // HEAD_NUM),
+        var_len=var_len,
+        cu_seqlens=cu_seqlens,
     )
 
 
@@ -156,9 +181,12 @@ def npu_transform(B, S, N, N_KV, D, dtype, use_padding):
 @pytest.mark.parametrize("test_dtype", DTYPE_LIST)
 @pytest.mark.parametrize("num_kv_head", NUM_KV_HEAD_LIST)
 @pytest.mark.parametrize("use_padding", USE_PADDING)
-def test_NPU_fa(micro_bsz, test_dtype, num_kv_head, use_padding):
+@pytest.mark.parametrize("var_len", VAR_LEN)
+def test_NPU_fa(micro_bsz, test_dtype, num_kv_head, use_padding, var_len):
     if internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
-        npu_transform(micro_bsz, SEQ_LEN, HEAD_NUM, num_kv_head, HIDDEN_SZIE // HEAD_NUM, test_dtype, use_padding)
+        npu_transform(
+            micro_bsz, SEQ_LEN, HEAD_NUM, num_kv_head, HIDDEN_SZIE // HEAD_NUM, test_dtype, use_padding, var_len
+        )
 
 
 if __name__ == "__main__":

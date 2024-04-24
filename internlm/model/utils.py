@@ -671,7 +671,6 @@ def unpack_qkv_before_attn(cur_input=None, cu_seqlens=None, padding_v: int = 0):
     qkv: the shape is (1, packed_length, three, head_num, head_dim)
     kv: the shape is (1, packed_length, two, head_num, head_dim)
     q/k/v: the shape is (1, packed_length, head_num, head_dim)
-
     Return:
     output: the shape is (micro_bsz, seq_len, three, head_num, head_dim) for qkv
                         (micro_bsz, seq_len, two, head_num, head_dim) for kv
@@ -692,20 +691,20 @@ def unpack_qkv_before_attn(cur_input=None, cu_seqlens=None, padding_v: int = 0):
     return padded_sequences
 
 
-def pack_output_after_attn(cur_input=None, cu_seqlens=None, padding_v: int = 0):
+def pack_output_after_attn(cur_input=None, cu_seqlens=None, padding_v: int = 0, packed_len: int = 0):
     """
     cur_input: the shape is (micro_bsz, seq_len, hidden_size)
-
     Return:
     output: the shape is (1, packed_length, hidden_size)
     """
     if cu_seqlens is None or cur_input is None:
         raise ValueError("cu_seqlens and cur_input must be provided.")
 
-    packed_len_ = gpc.config.data.micro_bsz * gpc.config.data.seq_len
+    if packed_len == 0:
+        packed_len = gpc.config.data.micro_bsz * gpc.config.data.seq_len
     output_shape = list(cur_input.shape)
     output_shape[0] = 1
-    output_shape[1] = packed_len_
+    output_shape[1] = packed_len
 
     output = torch.full(output_shape, fill_value=padding_v, device=cur_input.device, dtype=cur_input.dtype)
     for i in range(len(cu_seqlens) - 1):

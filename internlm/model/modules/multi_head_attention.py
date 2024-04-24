@@ -19,7 +19,6 @@ from internlm.model.modules.embedding import (
     RotaryEmbedding,
 )
 from internlm.model.ops.linear import get_linear_cls
-from internlm.model.utils import pack_output_after_attn, unpack_qkv_before_attn
 from internlm.utils.common import get_current_device
 
 internlm_accelerator = get_accelerator()
@@ -39,11 +38,9 @@ def get_gqa_attn_cls(use_flash_attn, tp_mode, causal, softmax_scale, dropout, se
 
             inner_attn, inner_cross_attn_cls = flash_attn_varlen_kvpacked_func, FlashCrossAttention
         elif device_backend == AcceleratorType.NPU:
-            from internlm.model.modules.multi_head_attention import (
-                AscendFlashSelfAttention,
-            )
+            from internlm.model.modules.multi_head_attention import AscendFlashAttention
 
-            inner_attn_cls, inner_cross_attn_cls = AscendFlashSelfAttention, AscendFlashSelfAttention
+            inner_attn_cls, inner_cross_attn_cls = AscendFlashAttention, AscendFlashAttention
             inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout)
         elif device_backend == AcceleratorType.DIPU:
             from deeplink_ext.internevo_ops import (
@@ -68,10 +65,16 @@ def get_gqa_attn_cls(use_flash_attn, tp_mode, causal, softmax_scale, dropout, se
     return inner_attn, inner_cross_attn
 
 
-class AscendFlashSelfAttention(torch.nn.Module):
-    """Implement the scaled dot product attention with softmax.
+class AscendFlashAttention(torch.nn.Module):
+    """Support Huawei Ascend's torch_npu flash attention.
+    Tested version:
+        torch: 2.1.0+cpu
+        torch_npu: 2.1.0.post3+git7c4136d
+        cann: 8.0.RC1.alpha003
     Arguments
     ---------
+        causal: When causal is True, the generated attentionmask is a lower triangular matrix,
+            which can only be set to True by now.
         softmax_scale: The temperature to use for the softmax attention.
                       (default: 1/sqrt(d_keys) where d_keys is computed at
                       runtime)
@@ -84,25 +87,17 @@ class AscendFlashSelfAttention(torch.nn.Module):
         causal: bool = True,
         softmax_scale: float = None,
         attention_dropout: float = 0.0,
-        use_varlen_fa=True,
     ):
         super().__init__()
         assert rearrange is not None, "Please install einops first, e.g., with pip install einops"
         self.causal = causal
         self.softmax_scale = softmax_scale
-        self.use_varlen_fa = use_varlen_fa
         self.dropout_p = attention_dropout
 
-        if use_varlen_fa:
-            self.shape_order = "TND"
-        else:
-            self.shape_order = "BSND"
-
         if self.causal:
-            self.sparse_mode = 0
             self.next_tockens = 0
         else:
-            assert False, "Ascend flash attention unsupport causal=False now!"
+            assert False, "InternEvo unsupports Ascend flash attention to set causal=False now!"
 
     def forward(
         self,
@@ -111,10 +106,12 @@ class AscendFlashSelfAttention(torch.nn.Module):
         k=None,
         v=None,
         kv=None,
-        cu_seqlens_q=None,  # pylint: disable=W0613
-        cu_seqlens_k=None,  # pylint: disable=W0613
-        max_seqlen_q=None,  # pylint: disable=W0613
-        max_seqlen_k=None,  # pylint: disable=W0613
+        cu_seqlens=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
         dropout_p=0.0,
         softmax_scale=None,
         causal=False,
@@ -145,6 +142,23 @@ class AscendFlashSelfAttention(torch.nn.Module):
         if softmax_scale:
             assert softmax_scale == self.softmax_scale
 
+        if cu_seqlens is not None:
+            assert max_seqlen is not None
+            assert (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k) == (None, None, None, None)
+
+            cu_seqlens_q, cu_seqlens_k = cu_seqlens, cu_seqlens
+            max_seqlen_q, max_seqlen_k = max_seqlen, max_seqlen
+            self.use_varlen_fa = True
+        elif cu_seqlens_q is not None:
+            assert cu_seqlens is None
+            assert (cu_seqlens_k, max_seqlen_q, max_seqlen_k) != (None, None, None)
+            self.use_varlen_fa = True
+        else:
+            self.use_varlen_fa = False
+
+        self.shape_order = "TND" if self.use_varlen_fa else "BSND"
+        self.sparse_mode = 1 if self.use_varlen_fa else 0
+
         return self._forward(
             q,
             k,
@@ -153,6 +167,8 @@ class AscendFlashSelfAttention(torch.nn.Module):
             actual_seq_kvlen=cu_seqlens_k,
             deterministic=deterministic,
             attention_mask=attention_mask,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
 
     def _forward(
@@ -162,8 +178,10 @@ class AscendFlashSelfAttention(torch.nn.Module):
         v,
         deterministic: bool = False,
         attention_mask: Tensor = None,
-        actual_seq_qlen: Tensor = None,  # pylint: disable=W0613
-        actual_seq_kvlen: Tensor = None,  # pylint: disable=W0613
+        actual_seq_qlen: Tensor = None,
+        actual_seq_kvlen: Tensor = None,
+        max_seqlen_q: int = None,
+        max_seqlen_k: int = None,
     ):
         """Implements the multihead softmax attention.
         Arguments
@@ -177,7 +195,7 @@ class AscendFlashSelfAttention(torch.nn.Module):
             k = k.squeeze(dim=2)
             v = v.squeeze(dim=2)
 
-        B, S, N, D = q.shape[0], q.shape[1], q.shape[2], q.shape[3]  # noqa: F841  # pylint: disable=W0612
+        B, S, N, _ = q.shape[0], q.shape[1], q.shape[2], q.shape[3]
 
         if self.shape_order == "BSH":
             q, k, v = [rearrange(x, "b s h d -> b s (h d)") for x in [q, k, v]]
@@ -186,18 +204,19 @@ class AscendFlashSelfAttention(torch.nn.Module):
         elif self.shape_order == "TND":
             assert B == 1
             q, k, v = [rearrange(x, "b s h d -> (b s) h d") for x in [q, k, v]]
-        # elif self.shape_order != "BSND":
-        #     raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
 
-        if attention_mask is None:
-            attention_mask = torch.triu(torch.ones(S, S, device=get_current_device()), 1).bool()
+        assert not (actual_seq_qlen is None) ^ (actual_seq_kvlen is None)
 
-        assert not ((actual_seq_qlen is None) ^ (actual_seq_kvlen is None))
-
-        if actual_seq_qlen is not None:
+        if self.use_varlen_fa:
+            if attention_mask is None:
+                attention_mask = torch.triu(
+                    torch.ones(max_seqlen_q, max_seqlen_k, device=get_current_device()), 1
+                ).bool()
             actual_seq_qlen = actual_seq_qlen[1:].tolist()
-        if actual_seq_kvlen is not None:
             actual_seq_kvlen = actual_seq_kvlen[1:].tolist()
+        else:
+            if attention_mask is None:
+                attention_mask = torch.triu(torch.ones(S, S, device=get_current_device()), 1).bool()
 
         output = torch_npu.npu_fusion_attention(
             query=q,
@@ -223,8 +242,6 @@ class AscendFlashSelfAttention(torch.nn.Module):
             output = rearrange(output, "s b (h d) -> b s h d", h=N)
         elif self.shape_order == "TND":
             output = rearrange(output, "s h d -> s (h d)")
-        # elif self.shape_order != "BSND":
-        #     raise ValueError("Invalid shape-order: {}, shape-order must be SBH or BSH or BSND".format(self.shape_order))
 
         return output
 
@@ -591,7 +608,7 @@ class MHA(nn.Module):
                     FlashSelfAttention,
                 )
             elif internlm_accelerator.get_accelerator_backend() == AcceleratorType.NPU:
-                FlashCrossAttention, FlashSelfAttention = AscendFlashSelfAttention, AscendFlashSelfAttention
+                FlashCrossAttention, FlashSelfAttention = AscendFlashAttention, AscendFlashAttention
             elif internlm_accelerator.get_accelerator_backend() == AcceleratorType.DIPU:
                 from deeplink_ext.internevo_ops import (
                     FlashCrossAttention,
@@ -860,16 +877,10 @@ class MHA(nn.Module):
         qkv = self.rotary_emb(qkv, **kwargs)
 
         kwargs.pop("indexes")
-        cu_seqlens = kwargs["cu_seqlens"]
 
         # for packed data, batch dimension with a size of 1 should be directly squeezed off.
         if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
             qkv = qkv.squeeze(0)
-        # since torch_npu only supports fa with no packed data currently, qkv should be unpacked
-        elif internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
-            qkv = unpack_qkv_before_attn(qkv, cu_seqlens)
-            kwargs.pop("cu_seqlens")
-            kwargs.pop("max_seqlen")
 
         if inference_params is None:
             if gpc.config.model.dtype is torch.float32 and gpc.config.model.use_flash_attn:
@@ -886,9 +897,6 @@ class MHA(nn.Module):
         if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
             context = rearrange(context, "s h d -> s (h d)")  # recover the shape
             context = context.unsqueeze(0)  # restore bsz dimension
-        elif internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
-            context = rearrange(context, "b s h d -> b s (h d)")  # recover the shape
-            context = pack_output_after_attn(context, cu_seqlens)
 
         out = self.out_proj(context)
 
