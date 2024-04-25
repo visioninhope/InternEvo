@@ -185,27 +185,3 @@ def try_import_scatter_sum():
         logger.warning("Use vanilla_scatter rather than cuda_scatter. Please note this!")
 
     return None
-
-
-# FlashAttn
-def try_import_linear_bias_wgrad():
-    """
-    Try import linear_bias_wgrad from flash_attn, if failed, return None
-
-    """
-    try:
-        if internlm_accelerator.get_accelerator_backend() is AcceleratorType.GPU:
-            import fused_dense_lib as fused_dense_cuda
-
-            if gpc.is_rank_for_log():
-                logger.warning("Use flash_attn linear_bias_wgrad. Please note this!")
-
-            return fused_dense_cuda.linear_bias_wgrad
-
-    except (ModuleNotFoundError, ImportError):
-        pass
-
-    if gpc.is_rank_for_log():
-        logger.warning("Use linear_bias_wgrad_torch. Please note this!")
-
-    return None

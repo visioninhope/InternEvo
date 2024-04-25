@@ -12,7 +12,6 @@ from torch.nn.utils.rnn import pad_sequence
 
 from internlm.accelerator import get_accelerator
 from internlm.core.context import global_context as gpc
-from internlm.model.ops.fusion_ops_import_helper import try_import_linear_bias_wgrad
 from internlm.utils.logger import get_logger
 
 internlm_accelerator = get_accelerator()
@@ -30,11 +29,8 @@ def linear_bias_wgrad_torch(my_input, grad_output, has_d_bias):
     return grad_weight, grad_bias
 
 
-linear_bias_wgrad = try_import_linear_bias_wgrad()
-is_using_cuda_linear_bias_wgrad = True
-if linear_bias_wgrad is None:
-    linear_bias_wgrad = linear_bias_wgrad_torch
-    is_using_cuda_linear_bias_wgrad = False
+linear_bias_wgrad = linear_bias_wgrad_torch
+is_using_cuda_linear_bias_wgrad = False
 
 
 # Raw operation, does not support autograd, but does support async
