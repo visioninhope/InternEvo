@@ -412,7 +412,7 @@ class MHA(nn.Module):
         if inference_params is None:
             kv = torch.concat([k.unsqueeze(2), v.unsqueeze(2)], dim=2)
             # for packed data, batch dimension with a size of 1 should be directly squeezed off.
-            if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+            if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.GPU, AcceleratorType.DIPU]:
                 q = q.squeeze(0)
                 kv = kv.squeeze(0)
 
@@ -448,7 +448,7 @@ class MHA(nn.Module):
         else:
             raise RuntimeError("Not support this right now")
 
-        if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+        if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.GPU, AcceleratorType.DIPU]:
             context = rearrange(context, "s h d -> s (h d)")  # recover the shape
             context = context.unsqueeze(0)  # restore bsz dimension
         out = self.wo(context)

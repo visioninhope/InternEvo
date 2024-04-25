@@ -879,7 +879,7 @@ class MHA(nn.Module):
         kwargs.pop("indexes")
 
         # for packed data, batch dimension with a size of 1 should be directly squeezed off.
-        if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+        if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.GPU, AcceleratorType.DIPU]:
             qkv = qkv.squeeze(0)
 
         if inference_params is None:
@@ -894,7 +894,7 @@ class MHA(nn.Module):
         else:
             raise RuntimeError("Not support this right now")
 
-        if internlm_accelerator.get_accelerator_backend() == AcceleratorType.GPU:
+        if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.GPU, AcceleratorType.DIPU]:
             context = rearrange(context, "s h d -> s (h d)")  # recover the shape
             context = context.unsqueeze(0)  # restore bsz dimension
 
