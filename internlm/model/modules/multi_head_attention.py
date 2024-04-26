@@ -241,7 +241,7 @@ class AscendFlashAttention(torch.nn.Module):
         elif self.shape_order == "SBH":
             output = rearrange(output, "s b (h d) -> b s h d", h=N)
         elif self.shape_order == "TND":
-            output = rearrange(output, "s h d -> s (h d)")
+            output = rearrange(output, "(one s) h d -> one s (h d)", one=1)
 
         return output
 
