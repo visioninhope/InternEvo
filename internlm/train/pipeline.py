@@ -1,19 +1,12 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-import functools
 import math
 import time
 from typing import Callable, Iterable, List, Optional, Union
 
 import torch
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    BackwardPrefetch,
-    ShardingStrategy,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 
 from internlm.accelerator import AcceleratorType, get_accelerator
@@ -38,8 +31,6 @@ from internlm.core.trainer import TrainState
 from internlm.data.utils import unpack_data
 from internlm.model.metrics import SchedulerMetricHook
 from internlm.model.modules.embedding import Embedding1D
-from internlm.model.modules.mlp import FeedForward
-from internlm.model.modules.multi_head_attention import MHA
 from internlm.model.moe.megablock.mlp import (
     MegaBlockFeedForward,
     MegaBlockGroupedFeedForward,
@@ -53,9 +44,7 @@ from internlm.model.ops.linear import (
     BaseScaleColumnParallelLinear,
     ColumnParallelLinearTorch,
     ISPLinear,
-    RewardModelLinear,
     RowParallelLinearTorch,
-    ScaleColumnParallelLinear,
 )
 from internlm.model.utils import is_moe_param
 from internlm.monitor import set_env_var
@@ -217,43 +206,6 @@ def initialize_model(pre_process_func: Optional[Callable] = None, post_process_f
     # state in the same dp group are all the same.
     random_mode = ParallelMode.WEIGHT_DATA if is_using_isp() else ParallelMode.DATA
     set_mode(random_mode)
-
-    # if fsdp enabled, wrap the model
-    model = wrap_FSDP_model(model)
-
-    return model
-
-
-def wrap_FSDP_model(model: Union[nn.Module, nn.ModuleList]):
-    if gpc.config.parallel.zero1.fsdp and gpc.config.model.use_flash_attn:
-        from flash_attn.modules.embedding import ParallelGPT2Embeddings
-
-        # set wrap_policy for fsdp wrap
-        transformer_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                Embedding1D,
-                ParallelGPT2Embeddings,
-                MHA,
-                RMSNorm,
-                FeedForward,
-                RewardModelLinear,
-                ScaleColumnParallelLinear,
-            },
-        )
-
-        # wrap the model
-        grp = gpc.get_group(ParallelMode.ZERO1)
-        model = FSDP(  # pylint: disable=unexpected-keyword-arg
-            module=model,
-            process_group=grp,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            auto_wrap_policy=transformer_wrap_policy,
-            forward_prefetch=True,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            limit_all_gathers=True,
-            use_orig_params=True,
-        )
 
     return model
 
