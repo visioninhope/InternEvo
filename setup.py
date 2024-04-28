@@ -17,13 +17,18 @@ def get_version():
         content = f.read()
     return content
 
+proj_version = get_version()
+
 setup(
     name='InternEvo',
-    version=get_version(),
+    version=proj_version,
     description='an open-sourced lightweight training framework aims to support model pre-training without the need for extensive dependencies',
     long_description=readme(),
     long_description_content_type='text/markdown',
     packages=find_packages(),
+    install_requires=[
+        f'rotary_emb=={proj_version}',
+    ],
 
     classifiers=[
         'Programming Language :: Python :: 3.8',

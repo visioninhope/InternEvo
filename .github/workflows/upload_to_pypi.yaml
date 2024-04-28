@@ -38,6 +38,10 @@ jobs:
         export PYTHONPATH=$PWD:$PYTHONPATH
         jobname=${GITHUB_RUN_ID}-${GITHUB_JOB}-${GITHUB_RUN_ATTEMPT}
         srun -p ${SLURM_PARTITION} --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 1 --gres=gpu:1 python setup.py sdist bdist_wheel
+        cd csrc/rotary/
+        srun -p ${SLURM_PARTITION} --kill-on-bad-exit=1 --job-name=$jobname -N 1 -n 1 --gres=gpu:1 python setup.py sdist bdist_wheel
+        cd ../../
         exit_code=$?
         twine upload -u __token__ -p ${{ secrets.PYPI_API_TOKEN }} dist/*
+        twine upload -u __token__ -p ${{ secrets.PYPI_API_TOKEN }} csrc/rotary/dist/*
         sh ./ci_scripts/common/check_slurm_cancled.sh $exit_code $jobname
