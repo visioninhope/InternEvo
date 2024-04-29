@@ -8,7 +8,7 @@ from setuptools.command.install import install
 pwd = os.path.dirname(__file__)
 
 def readme():
-    with open(os.path.join(pwd, 'README.md'), encoding='utf-8') as f:
+    with open(os.path.join(pwd, 'README.md')) as f:
         content = f.read()
     return content
 
@@ -27,7 +27,7 @@ setup(
     long_description_content_type='text/markdown',
     packages=find_packages(),
     install_requires=[
-        f'rotary_emb=={proj_version}',
+        'rotary_emb=={}'.format(proj_version),
     ],
 
     classifiers=[

@@ -9,9 +9,6 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtensio
 from setuptools import setup, find_packages
 import subprocess
 
-# ninja build does not work unless include_dirs are abs path
-this_dir = os.path.dirname(os.path.abspath(__file__))
-
 
 def get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
